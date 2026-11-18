@@ -1,6 +1,6 @@
 
 --========================================================
--- NIGHTSAKEN v0.2
+-- NIGHTSAKEN v0.3
 -- FORSAKEN MOBILE OPTIMIZER
 -- UI: WINDUI
 -- EXECUTOR: DELTA
@@ -21,14 +21,15 @@ local Player = Players.LocalPlayer
 -- CONFIGURATION
 --========================================================
 
-local CONFIG_FILE = "NIGHTSAKEN_V02.json"
+local CONFIG_FILE = "NIGHTSAKEN_V03.json"
 
 local Settings = {
     LowGraphics = false,
     ExtremelyLow = false,
     OptimizeLighting = false,
     RemoveVegetation = false,
-    RemoveDecoration = false
+    RemoveDecoration = false,
+    OptimizeOutro = false
 }
 
 local Palette = {
@@ -41,15 +42,31 @@ local Palette = {
 local WindUI = nil
 local Window = nil
 
-local EnqueueJob
+local BatchSize = 40
+local BatchDelay = 0.015
+
+--========================================================
+-- STATES
+--========================================================
+
 local JobQueue = {}
 local JobRunning = false
 
-local ProcessedVegetation = setmetatable({}, {__mode = "k"})
-local ProcessedDecoration = setmetatable({}, {__mode = "k"})
+local GraphicsProcessed = setmetatable({}, {__mode = "k"})
+local VegetationProcessed = setmetatable({}, {__mode = "k"})
+local DecorationProcessed = setmetatable({}, {__mode = "k"})
+
+local MapSnapshots = setmetatable({}, {__mode = "k"})
+local MapVegetationDone = setmetatable({}, {__mode = "k"})
+local MapDecorationDone = setmetatable({}, {__mode = "k"})
+
+local CurrentMapReference = nil
+local CurrentMapActive = false
+
+local EnqueueJob
 
 --========================================================
--- SAVE / LOAD SETTINGS
+-- SETTINGS
 --========================================================
 
 local function LoadSettings()
@@ -66,7 +83,9 @@ local function LoadSettings()
 
     if success and type(data) == "table" then
         for key in pairs(Settings) do
-            Settings[key] = data[key] == true
+            if data[key] ~= nil then
+                Settings[key] = data[key] == true
+            end
         end
     end
 end
@@ -77,10 +96,7 @@ local function SaveSettings()
     end
 
     pcall(function()
-        writefile(
-            CONFIG_FILE,
-            HttpService:JSONEncode(Settings)
-        )
+        writefile(CONFIG_FILE, HttpService:JSONEncode(Settings))
     end)
 end
 
@@ -106,25 +122,45 @@ local function Notify(title, message)
 end
 
 --========================================================
--- REMOVER KEYWORDS
+-- NAME NORMALIZATION
+--========================================================
+
+local function NormalizeName(name)
+    name = string.lower(tostring(name))
+    name = name:gsub("[%s_%-%.]", "")
+    return name
+end
+
+local function ContainsKeyword(name, keywords)
+    name = NormalizeName(name)
+
+    for _, keyword in ipairs(keywords) do
+        if string.find(
+            name,
+            NormalizeName(keyword),
+            1,
+            true
+        ) then
+            return true
+        end
+    end
+
+    return false
+end
+
+--========================================================
+-- ENGLISH KEYWORDS
 --========================================================
 
 local VegetationKeywords = {
-    "tree", "trees", "treepart", "treemodel",
-    "leaf", "leaves", "foliage", "branch",
-    "branches", "trunk", "stump", "wood",
-    "bush", "bushes", "shrub", "shrubs",
-    "grass", "flower", "flowers", "plant",
-    "plants", "fern", "ferns", "vine",
-    "vines", "vegetation", "mushroom",
-    "mushrooms", "weed", "weeds",
-    "rock", "rocks", "pebble", "pebbles",
-    "rockformation", "log", "logs",
-    "arbol", "arboles", "hoja", "hojas",
-    "rama", "ramas", "arbusto", "arbustos",
-    "pasto", "hierba", "flor", "flores",
-    "planta", "plantas", "piedra", "piedras",
-    "helecho", "tronco", "musgo"
+    "tree", "trees", "leaf", "leaves",
+    "foliage", "branch", "branches",
+    "trunk", "stump", "bush", "bushes",
+    "shrub", "grass", "flower", "flowers",
+    "plant", "plants", "fern", "vine",
+    "mushroom", "weed", "log", "logs",
+    "vegetation", "pine", "oak", "palm",
+    "hedge", "ivy"
 }
 
 local DecorationKeywords = {
@@ -137,18 +173,15 @@ local DecorationKeywords = {
     "billiard", "pooltable", "television",
     "tv", "mannequin", "statue", "sign",
     "barrel", "crate", "lantern", "candle",
-    "ball", "sphere", "computer", "monitor",
-    "briefcase", "bench", "foodstand",
-    "fooddisplay", "decoration", "ornament",
-    "poster", "clock", "cabinet", "vendingmachine",
-    "trashcan", "plantpot", "flowerpot",
-    "pelota", "silla", "mesa", "lampara",
-    "cuadro", "barril", "caja", "estatua",
-    "banco", "alfombra", "decoracion",
-    "maceta", "reloj", "television",
-    "sofa", "sillon", "cartel", "estante",
-    "computadora", "monitor", "candelabro",
-    "cajero", "maquina", "bote", "basurero"
+    "computer", "monitor", "bench",
+    "foodstand", "decoration", "ornament",
+    "poster", "clock", "cabinet",
+    "vendingmachine", "trashcan",
+    "plantpot", "flowerpot", "furniture",
+    "bookshelf", "bookcase", "chandelier",
+    "pictureframe", "paintingframe",
+    "fireplace", "fountain", "sculpture",
+    "mailbox", "trafficcone", "roadbarrier"
 }
 
 --========================================================
@@ -165,42 +198,10 @@ local ProtectedKeywords = {
     "player", "npc", "rig", "camera",
     "mapboundary", "invisiblewall",
     "ability", "health", "damage",
-    "round", "timer"
+    "round", "timer", "outro",
+    "stairs", "floor", "ground",
+    "wall", "ceiling", "barrier"
 }
-
---========================================================
--- NAME NORMALIZATION
---========================================================
-
-local function NormalizeName(name)
-    name = string.lower(tostring(name))
-    name = name:gsub("[%s_%-%.]", "")
-    name = name:gsub("[áàä]", "a")
-    name = name:gsub("[éèë]", "e")
-    name = name:gsub("[íìï]", "i")
-    name = name:gsub("[óòö]", "o")
-    name = name:gsub("[úùü]", "u")
-
-    return name
-end
-
-local function ContainsKeyword(name, keywords)
-    name = NormalizeName(name)
-
-    for _, keyword in ipairs(keywords) do
-        local normalized = NormalizeName(keyword)
-
-        if string.find(name, normalized, 1, true) then
-            return true
-        end
-    end
-
-    return false
-end
-
---========================================================
--- COLLISION PROXY DETECTION
---========================================================
 
 local function IsCollisionProxy(object)
     local current = object
@@ -216,12 +217,28 @@ local function IsCollisionProxy(object)
     return false
 end
 
---========================================================
--- PROTECTION SYSTEM
---========================================================
+local function HasInteraction(object)
+    if not object:IsA("Model") then
+        return false
+    end
+
+    for _, item in ipairs(object:GetDescendants()) do
+        if item:IsA("ProximityPrompt")
+            or item:IsA("ClickDetector")
+            or item:IsA("Humanoid")
+            or item:IsA("Tool")
+            or item:IsA("Seat")
+            or item:IsA("VehicleSeat")
+            or item:IsA("SpawnLocation") then
+            return true
+        end
+    end
+
+    return false
+end
 
 local function IsProtected(object)
-    if not object then
+    if not object or not object.Parent then
         return true
     end
 
@@ -229,44 +246,31 @@ local function IsProtected(object)
         return true
     end
 
+    if Player.Character
+        and object:IsDescendantOf(Player.Character) then
+        return true
+    end
+
     local current = object
 
     while current and current ~= Workspace do
-        if ContainsKeyword(
-            current.Name,
-            ProtectedKeywords
-        ) then
+        if ContainsKeyword(current.Name, ProtectedKeywords) then
             return true
         end
 
         current = current.Parent
     end
 
-    if Player.Character
-        and object:IsDescendantOf(Player.Character) then
+    if HasInteraction(object) then
         return true
-    end
-
-    if object:IsA("Model") then
-        for _, descendant in ipairs(object:GetDescendants()) do
-            if descendant:IsA("ProximityPrompt")
-                or descendant:IsA("ClickDetector")
-                or descendant:IsA("Humanoid")
-                or descendant:IsA("Tool")
-                or descendant:IsA("Seat")
-                or descendant:IsA("VehicleSeat")
-                or descendant:IsA("SpawnLocation") then
-
-                return true
-            end
-        end
     end
 
     return false
 end
 
+print("[NIGHTSAKEN] Parte 1 cargada")
 --========================================================
--- GRAPHICS OPTIMIZATION
+-- PART 2: GRAPHICS OPTIMIZER
 --========================================================
 
 local function OptimizeObject(object)
@@ -276,12 +280,25 @@ local function OptimizeObject(object)
 
     pcall(function()
         if object:IsA("BasePart") then
-            object.Material = Enum.Material.SmoothPlastic
-            object.CastShadow = false
+            local state = GraphicsProcessed[object] or {}
+
+            if not state.Basic then
+                object.Material = Enum.Material.SmoothPlastic
+                object.CastShadow = false
+                state.Basic = true
+            end
+
+            if Settings.ExtremelyLow and not state.Extreme then
+                object.Color = Palette[
+                    math.random(1, #Palette)
+                ]
+                state.Extreme = true
+            end
+
+            GraphicsProcessed[object] = state
 
         elseif object:IsA("Decal")
             or object:IsA("Texture") then
-
             object.Transparency = 1
 
         elseif object:IsA("ParticleEmitter")
@@ -289,47 +306,13 @@ local function OptimizeObject(object)
             or object:IsA("Beam")
             or object:IsA("Smoke")
             or object:IsA("Fire")
-            or object:IsA("Sparkles")
-            or object:IsA("PostEffect") then
-
+            or object:IsA("Sparkles") then
             object.Enabled = false
         end
     end)
 end
 
-local function ApplyLowGraphics()
-    local objects = Workspace:GetDescendants()
-
-    for index, object in ipairs(objects) do
-        OptimizeObject(object)
-
-        if index % 120 == 0 then
-            task.wait()
-        end
-    end
-end
-
-local function ApplyExtremeGraphics()
-    local objects = Workspace:GetDescendants()
-
-    for index, object in ipairs(objects) do
-        OptimizeObject(object)
-
-        if object:IsA("BasePart") then
-            pcall(function()
-                object.Color = Palette[
-                    math.random(1, #Palette)
-                ]
-            end)
-        end
-
-        if index % 120 == 0 then
-            task.wait()
-        end
-    end
-end
-
-local function ApplyLightingOptimization()
+local function OptimizeLighting()
     pcall(function()
         Lighting.GlobalShadows = false
         Lighting.FogEnd = 100000
@@ -343,242 +326,105 @@ local function ApplyLightingOptimization()
     end)
 end
 
-local function SetLowGraphics(enabled)
-    Settings.LowGraphics = enabled
-    SaveSettings()
-
-    if enabled then
-        EnqueueJob("Low Graphics", ApplyLowGraphics)
-    end
-end
-
-local function SetExtremelyLow(enabled)
-    Settings.ExtremelyLow = enabled
-    SaveSettings()
-
-    if enabled then
-        EnqueueJob("Extremely Low Graphics", ApplyExtremeGraphics)
-    end
-end
-
-local function SetOptimizeLighting(enabled)
-    Settings.OptimizeLighting = enabled
-    SaveSettings()
-
-    if enabled then
-        EnqueueJob("Optimize Lighting", ApplyLightingOptimization)
-    end
-end
-
 --========================================================
--- VEGETATION COLLISION SYSTEM
+-- PART 2: VEGETATION REMOVER
 --========================================================
 
-local function IsStaticObject(object)
-    if object:IsA("BasePart") then
-        return object.Anchored
-    end
+-- No crea copias de modelos.
+-- Oculta únicamente la parte visual y conserva
+-- las propiedades de colisión originales.
 
-    if object:IsA("Model") then
-        local found = false
-
-        for _, item in ipairs(object:GetDescendants()) do
-            if item:IsA("BasePart") then
-                found = true
-
-                if not item.Anchored then
-                    return false
-                end
-            end
-        end
-
-        return found
-    end
-
-    return false
-end
-
---========================================================
--- CONFIGURE INVISIBLE COLLISION COPY
---========================================================
-
-local function ConfigureCollisionPart(part)
-    if not part:IsA("BasePart") then
-        return
-    end
-
-    part.Transparency = 1
-    part.LocalTransparencyModifier = 1
-    part.CastShadow = false
-
-    -- No cambiamos:
-    -- CanCollide
-    -- CanTouch
-    -- CanQuery
-    -- CFrame
-    -- Size
-    -- Anchored
-end
-
-local function PrepareCollisionCopy(original)
-    local oldArchivable = original.Archivable
-
-    pcall(function()
-        original.Archivable = true
-    end)
-
-    local clone = nil
-
-    local cloneSuccess = pcall(function()
-        clone = original:Clone()
-    end)
-
-    pcall(function()
-        original.Archivable = oldArchivable
-    end)
-
-    if not cloneSuccess or not clone then
-        return nil
-    end
-
-    clone.Name = "NS_CollisionProxy"
-
-    local descendants = clone:GetDescendants()
-
-    for index, item in ipairs(descendants) do
-        if item:IsA("BasePart") then
-            ConfigureCollisionPart(item)
-
-        elseif item:IsA("Decal")
-            or item:IsA("Texture") then
-
-            item.Transparency = 1
-
-        elseif item:IsA("ParticleEmitter")
-            or item:IsA("Trail")
-            or item:IsA("Beam")
-            or item:IsA("Fire")
-            or item:IsA("Smoke")
-            or item:IsA("Sparkles")
-            or item:IsA("Highlight")
-            or item:IsA("PointLight")
-            or item:IsA("SpotLight")
-            or item:IsA("SurfaceLight") then
-
-            item.Enabled = false
-
-        elseif item:IsA("BillboardGui")
-            or item:IsA("SurfaceGui") then
-
-            item.Enabled = false
-
-        elseif item:IsA("Script")
-            or item:IsA("LocalScript")
-            or item:IsA("ModuleScript") then
-
-            item:Destroy()
-
-        elseif item:IsA("SurfaceAppearance") then
-            item:Destroy()
-        end
-
-        if index % 100 == 0 then
-            task.wait()
-        end
-    end
-
-    if clone:IsA("BasePart") then
-        ConfigureCollisionPart(clone)
-    end
-
-    return clone
-end
-
---========================================================
--- REPLACE ORIGINAL WITH COLLISION COPY
---========================================================
-
-local function RemoveVegetationWithCollision(object)
+local function HideVegetation(object)
     if not object or not object.Parent then
         return false
     end
 
-    if IsProtected(object) or not IsStaticObject(object) then
+    if IsProtected(object) then
         return false
     end
 
-    local parent = object.Parent
-    local clone = nil
+    local parts = {}
 
-    local success = pcall(function()
-        clone = PrepareCollisionCopy(object)
-
-        if not clone then
-            error("No se pudo crear la copia")
+    if object:IsA("BasePart") then
+        table.insert(parts, object)
+    elseif object:IsA("Model") then
+        for _, item in ipairs(object:GetDescendants()) do
+            if item:IsA("BasePart") then
+                table.insert(parts, item)
+            end
         end
+    else
+        return false
+    end
 
-        clone.Parent = parent
+    if #parts == 0 then
+        return false
+    end
 
-        -- Solo después de crear la copia,
-        -- destruimos el objeto original.
-        object:Destroy()
-    end)
+    for index, part in ipairs(parts) do
+        pcall(function()
+            part.LocalTransparencyModifier = 1
+            part.CastShadow = false
+        end)
 
-    if not success then
-        if clone then
+        if index % BatchSize == 0 then
+            task.wait(BatchDelay)
+        end
+    end
+
+    if object:IsA("Model") then
+        for _, item in ipairs(object:GetDescendants()) do
             pcall(function()
-                clone:Destroy()
+                if item:IsA("Decal")
+                    or item:IsA("Texture") then
+                    item.Transparency = 1
+
+                elseif item:IsA("ParticleEmitter")
+                    or item:IsA("Trail")
+                    or item:IsA("Beam")
+                    or item:IsA("Smoke")
+                    or item:IsA("Fire")
+                    or item:IsA("Sparkles") then
+                    item.Enabled = false
+                end
             end)
         end
-
-        return false
     end
 
     return true
 end
 
---========================================================
--- FIND VEGETATION CANDIDATES
---========================================================
-
-local function FindVegetationCandidates()
-    local objects = Workspace:GetDescendants()
+local function FindVegetationCandidates(objects)
+    local selected = {}
     local candidates = {}
-    local candidateSet = {}
 
     for index, object in ipairs(objects) do
         if (object:IsA("Model") or object:IsA("BasePart"))
-            and not IsCollisionProxy(object)
             and not IsProtected(object)
-            and IsStaticObject(object)
-            and ContainsKeyword(
-                object.Name,
-                VegetationKeywords
-            ) then
+            and ContainsKeyword(object.Name, VegetationKeywords) then
 
-            candidateSet[object] = true
+            selected[object] = true
         end
 
-        if index % 150 == 0 then
-            task.wait()
+        if index % BatchSize == 0 then
+            task.wait(BatchDelay)
         end
     end
 
-    -- Evitar procesar hijos de modelos seleccionados.
-    for object in pairs(candidateSet) do
+    for object in pairs(selected) do
         local parent = object.Parent
-        local hasCandidateParent = false
+        local hasParent = false
 
         while parent and parent ~= Workspace do
-            if candidateSet[parent] then
-                hasCandidateParent = true
+            if selected[parent] then
+                hasParent = true
                 break
             end
 
             parent = parent.Parent
         end
 
-        if not hasCandidateParent then
+        if not hasParent then
             table.insert(candidates, object)
         end
     end
@@ -586,133 +432,235 @@ local function FindVegetationCandidates()
     return candidates
 end
 
---========================================================
--- VEGETATION REMOVER
---========================================================
-
-local function RemoveVegetation()
-    local candidates = FindVegetationCandidates()
-
-    local removed = 0
-    local failed = 0
+local function RemoveVegetation(objects)
+    local candidates = FindVegetationCandidates(objects)
+    local hidden = 0
 
     for index, object in ipairs(candidates) do
-        if object.Parent then
-            if RemoveVegetationWithCollision(object) then
+        if object.Parent
+            and not VegetationProcessed[object] then
+
+            VegetationProcessed[object] = true
+
+            if HideVegetation(object) then
+                hidden = hidden + 1
+            end
+        end
+
+        if index % 10 == 0 then
+            task.wait()
+        end
+    end
+
+    Notify(
+        "Vegetation Remover",
+        "Vegetación visual ocultada: " .. tostring(hidden)
+    )
+end
+
+--========================================================
+-- PART 2: DECORATION REMOVER
+--========================================================
+
+local function RemoveMatchingObjects(objects, keywords)
+    local selected = {}
+    local candidates = {}
+    local removed = 0
+    local skipped = 0
+
+    for index, object in ipairs(objects) do
+        if (object:IsA("Model") or object:IsA("BasePart"))
+            and not IsProtected(object)
+            and ContainsKeyword(object.Name, keywords) then
+
+            selected[object] = true
+        end
+
+        if index % BatchSize == 0 then
+            task.wait(BatchDelay)
+        end
+    end
+
+    for object in pairs(selected) do
+        local parent = object.Parent
+        local hasParent = false
+
+        while parent and parent ~= Workspace do
+            if selected[parent] then
+                hasParent = true
+                break
+            end
+
+            parent = parent.Parent
+        end
+
+        if not hasParent then
+            table.insert(candidates, object)
+        end
+    end
+
+    for index, object in ipairs(candidates) do
+        if object.Parent and not IsProtected(object) then
+            DecorationProcessed[object] = true
+
+            local success = pcall(function()
+                object:Destroy()
+            end)
+
+            if success then
                 removed = removed + 1
             else
-                failed = failed + 1
+                skipped = skipped + 1
             end
         end
 
-        -- Repartir el trabajo para reducir bloqueos.
-        if index % 15 == 0 then
+        if index % 10 == 0 then
             task.wait()
         end
     end
 
-    print("[NIGHTSAKEN] Vegetación reemplazada:", removed)
-    print("[NIGHTSAKEN] Vegetación omitida:", failed)
-
-    return removed, failed
+    return removed, skipped
 end
 
+print("[NIGHTSAKEN] Parte 2 cargada")
 --========================================================
--- OLD DECORATION REMOVER
+-- PART 3: MATCH DETECTION
 --========================================================
 
-local function RemoveMatchingObjects(keywords)
-    local removed = 0
-    local objects = Workspace:GetDescendants()
+local LobbyNames = {
+    "lobby",
+    "mainlobby",
+    "waitingroom",
+    "intermission",
+    "menu"
+}
 
-    -- Primero modelos.
-    for index, object in ipairs(objects) do
-        if object.Parent
-            and object:IsA("Model")
-            and not IsCollisionProxy(object)
-            and ContainsKeyword(object.Name, keywords)
-            and not IsProtected(object) then
+local MapNames = {
+    "map",
+    "currentmap",
+    "activemap",
+    "mapfolder",
+    "gamemap",
+    "current_map",
+    "active_map"
+}
 
-            local success = pcall(function()
-                object:Destroy()
-            end)
+local MatchMarkers = {
+    "RoundActive",
+    "InRound",
+    "GameStarted",
+    "MatchStarted",
+    "RoundInProgress",
+    "IsPlaying"
+}
 
-            if success then
-                removed = removed + 1
-            end
+local function GetMarkerValue(container, markerName)
+    if not container then
+        return nil
+    end
+
+    local attribute = container:GetAttribute(markerName)
+
+    if type(attribute) == "boolean" then
+        return attribute
+    end
+
+    local value = container:FindFirstChild(markerName)
+
+    if value and (value:IsA("BoolValue")) then
+        return value.Value
+    end
+
+    return nil
+end
+
+local function GetMatchMarker()
+    for _, marker in ipairs(MatchMarkers) do
+        local value = GetMarkerValue(Workspace, marker)
+
+        if value ~= nil then
+            return value
         end
 
-        if index % 120 == 0 then
-            task.wait()
+        value = GetMarkerValue(Player, marker)
+
+        if value ~= nil then
+            return value
         end
     end
 
-    -- Después piezas individuales.
-    for index, object in ipairs(objects) do
-        if object.Parent
-            and object:IsA("BasePart")
-            and not IsCollisionProxy(object)
-            and ContainsKeyword(object.Name, keywords)
-            and not IsProtected(object) then
+    return nil
+end
 
-            local success = pcall(function()
-                object:Destroy()
-            end)
-
-            if success then
-                removed = removed + 1
-            end
-        end
-
-        if index % 120 == 0 then
-            task.wait()
+local function IsLobbyPresent()
+    for _, child in ipairs(Workspace:GetChildren()) do
+        if ContainsKeyword(child.Name, LobbyNames) then
+            return true
         end
     end
 
-    return removed
+    return false
 end
 
---========================================================
--- REMOVER CONTROLS CALLBACKS
---========================================================
-
-local function SetRemoveVegetation(enabled)
-    Settings.RemoveVegetation = enabled
-    SaveSettings()
-
-    if enabled then
-        EnqueueJob("Vegetation Remover", function()
-            local amount, failed = RemoveVegetation()
-
-            Notify(
-                "Vegetation Remover",
-                tostring(amount) .. " objetos reemplazados; "
-                .. tostring(failed) .. " omitidos"
-            )
-        end)
+local function GetCurrentMapRoot()
+    for _, child in ipairs(Workspace:GetChildren()) do
+        if ContainsKeyword(child.Name, MapNames) then
+            return child
+        end
     end
+
+    return nil
 end
 
-local function SetRemoveDecoration(enabled)
-    Settings.RemoveDecoration = enabled
-    SaveSettings()
+local function IsMatchActive()
+    local marker = GetMatchMarker()
 
-    if enabled then
-        EnqueueJob("Decoration Remover", function()
-            local amount = RemoveMatchingObjects(
-                DecorationKeywords
-            )
-
-            Notify(
-                "Decoration Remover",
-                "Decoración eliminada: " .. tostring(amount)
-            )
-        end)
+    if marker == false then
+        return false
     end
+
+    if marker == true then
+        return GetCurrentMapRoot() ~= nil
+    end
+
+    if IsLobbyPresent() then
+        return false
+    end
+
+    -- Sin un indicador confirmado de partida,
+    -- los removers permanecen detenidos.
+    return false
 end
 
 --========================================================
--- OPTIMIZATION QUEUE
+-- PART 3: MAP SNAPSHOT
+--========================================================
+
+local function CreateMapSnapshot(mapRoot)
+    if not mapRoot or not mapRoot.Parent then
+        return {}
+    end
+
+    if MapSnapshots[mapRoot] then
+        return MapSnapshots[mapRoot]
+    end
+
+    local objects = mapRoot:GetDescendants()
+
+    MapSnapshots[mapRoot] = objects
+
+    print(
+        "[NIGHTSAKEN] Mapa capturado:",
+        mapRoot.Name,
+        #objects,
+        "objetos"
+    )
+
+    return objects
+end
+
+--========================================================
+-- PART 3: JOB QUEUE
 --========================================================
 
 EnqueueJob = function(name, callback)
@@ -731,31 +679,20 @@ EnqueueJob = function(name, callback)
         while #JobQueue > 0 do
             local job = table.remove(JobQueue, 1)
 
-            Notify(
-                "NIGHTSAKEN",
-                "Procesando: " .. job.Name
-            )
-
-            local success, errorMessage = xpcall(
+            local success, err = xpcall(
                 job.Callback,
-                function(err)
-                    return tostring(err)
+                function(message)
+                    return tostring(message)
                 end
             )
 
-            if success then
-                print("[NIGHTSAKEN] Terminado:", job.Name)
-            else
+            if not success then
                 warn(
                     "[NIGHTSAKEN] Error en "
-                    .. job.Name .. ": "
-                    .. tostring(errorMessage)
+                    .. job.Name .. ": " .. tostring(err)
                 )
 
-                Notify(
-                    "NIGHTSAKEN",
-                    "Error en: " .. job.Name
-                )
+                Notify("NIGHTSAKEN", "Error en " .. job.Name)
             end
 
             task.wait(0.1)
@@ -763,17 +700,63 @@ EnqueueJob = function(name, callback)
 
         JobRunning = false
 
-        Notify(
-            "NIGHTSAKEN",
-            "Optimización terminada"
-        )
-
-        print("[NIGHTSAKEN] OPTIMIZACIÓN TERMINADA")
+        -- Si entró otro trabajo al terminar,
+        -- iniciar nuevamente la cola sin agregar
+        -- trabajos ficticios.
+        if #JobQueue > 0 then
+            EnqueueJob("Pending Jobs", function() end)
+        end
     end)
 end
 
 --========================================================
--- WINDUI LOADER
+-- PART 3: MAP REMOVERS
+--========================================================
+
+local function ProcessMapRemovers(mapRoot)
+    if not mapRoot or not IsMatchActive() then
+        return
+    end
+
+    local objects = CreateMapSnapshot(mapRoot)
+
+    if Settings.RemoveVegetation
+        and not MapVegetationDone[mapRoot] then
+
+        MapVegetationDone[mapRoot] = true
+
+        EnqueueJob("Vegetation Remover", function()
+            if IsMatchActive() then
+                RemoveVegetation(objects)
+            end
+        end)
+    end
+
+    if Settings.RemoveDecoration
+        and not MapDecorationDone[mapRoot] then
+
+        MapDecorationDone[mapRoot] = true
+
+        EnqueueJob("Decoration Remover", function()
+            if IsMatchActive() then
+                local removed, skipped = RemoveMatchingObjects(
+                    objects,
+                    DecorationKeywords
+                )
+
+                Notify(
+                    "Decoration Remover",
+                    tostring(removed) .. " eliminados; "
+                    .. tostring(skipped) .. " omitidos"
+                )
+            end
+        end)
+    end
+end
+
+print("[NIGHTSAKEN] Parte 3 cargada")
+--========================================================
+-- PART 4: WINDUI LOADER
 --========================================================
 
 local WINDUI_VERSION = "1.6.66"
@@ -790,7 +773,7 @@ if not fetchSuccess
     or type(source) ~= "string"
     or #source < 1000 then
 
-    warn("[NIGHTSAKEN] Error descargando WindUI:", source)
+    warn("[NIGHTSAKEN] Error descargando WindUI")
     return
 end
 
@@ -799,21 +782,21 @@ local compileSuccess, compiled = pcall(function()
 end)
 
 if not compileSuccess or type(compiled) ~= "function" then
-    warn("[NIGHTSAKEN] Error compilando WindUI:", compiled)
+    warn("[NIGHTSAKEN] Error compilando WindUI")
     return
 end
 
 local loadSuccess, loadedWindUI = pcall(compiled)
 
 if not loadSuccess or type(loadedWindUI) ~= "table" then
-    warn("[NIGHTSAKEN] Error iniciando WindUI:", loadedWindUI)
+    warn("[NIGHTSAKEN] Error iniciando WindUI")
     return
 end
 
 WindUI = loadedWindUI
 
 --========================================================
--- CREATE WINDOW
+-- PART 4: WINDOW
 --========================================================
 
 local windowSuccess, createdWindow = pcall(function()
@@ -821,9 +804,7 @@ local windowSuccess, createdWindow = pcall(function()
         Title = "NIGHTSAKEN",
         Author = "Forsaken Optimizer",
         Icon = "moon",
-
-        Folder = "NIGHTSAKEN_v02",
-
+        Folder = "NIGHTSAKEN_v03",
         Theme = "Dark",
         Size = UDim2.fromOffset(420, 430),
         MinSize = Vector2.new(300, 350),
@@ -834,7 +815,7 @@ local windowSuccess, createdWindow = pcall(function()
 end)
 
 if not windowSuccess or not createdWindow then
-    warn("[NIGHTSAKEN] Error creando ventana:", createdWindow)
+    warn("[NIGHTSAKEN] Error creando ventana")
     return
 end
 
@@ -842,14 +823,10 @@ Window = createdWindow
 
 pcall(function()
     Window:Tag({
-        Title = "v0.2",
+        Title = "v0.3",
         Color = Color3.fromHex("#89939B")
     })
 end)
-
---========================================================
--- CREATE TABS
---========================================================
 
 local tabsSuccess, tabs = pcall(function()
     return {
@@ -876,7 +853,7 @@ local tabsSuccess, tabs = pcall(function()
 end)
 
 if not tabsSuccess or not tabs then
-    warn("[NIGHTSAKEN] Error creando pestañas:", tabs)
+    warn("[NIGHTSAKEN] Error creando pestañas")
     return
 end
 
@@ -886,7 +863,116 @@ local SettingsTab = tabs.Settings
 local InfoTab = tabs.Info
 
 --========================================================
--- OPTIMIZER CONTROLS
+-- PART 4: GRAPHICS CALLBACKS
+--========================================================
+
+local function SetLowGraphics(enabled)
+    Settings.LowGraphics = enabled
+    SaveSettings()
+
+    if not enabled then
+        return
+    end
+
+    EnqueueJob("Low Graphics", function()
+        local objects = Workspace:GetDescendants()
+
+        for index, object in ipairs(objects) do
+            if Settings.LowGraphics or Settings.ExtremelyLow then
+                OptimizeObject(object)
+            end
+
+            if index % BatchSize == 0 then
+                task.wait(BatchDelay)
+            end
+        end
+    end)
+end
+
+local function SetExtremelyLow(enabled)
+    Settings.ExtremelyLow = enabled
+    SaveSettings()
+
+    if not enabled then
+        return
+    end
+
+    EnqueueJob("Extremely Low Graphics", function()
+        local objects = Workspace:GetDescendants()
+
+        for index, object in ipairs(objects) do
+            if Settings.ExtremelyLow then
+                OptimizeObject(object)
+            end
+
+            if index % BatchSize == 0 then
+                task.wait(BatchDelay)
+            end
+        end
+    end)
+end
+
+local function SetOptimizeLighting(enabled)
+    Settings.OptimizeLighting = enabled
+    SaveSettings()
+
+    if enabled then
+        EnqueueJob("Optimize Lighting", OptimizeLighting)
+    end
+end
+
+--========================================================
+-- PART 4: REMOVER CALLBACKS
+--========================================================
+
+local function SetRemoveVegetation(enabled)
+    Settings.RemoveVegetation = enabled
+    SaveSettings()
+
+    if not enabled then
+        return
+    end
+
+    if not IsMatchActive() then
+        Notify(
+            "Vegetation Remover",
+            "Esperando a que comience una partida"
+        )
+        return
+    end
+
+    local mapRoot = GetCurrentMapRoot()
+
+    if mapRoot then
+        ProcessMapRemovers(mapRoot)
+    end
+end
+
+local function SetRemoveDecoration(enabled)
+    Settings.RemoveDecoration = enabled
+    SaveSettings()
+
+    if not enabled then
+        return
+    end
+
+    if not IsMatchActive() then
+        Notify(
+            "Decoration Remover",
+            "Esperando a que comience una partida"
+        )
+        return
+    end
+
+    local mapRoot = GetCurrentMapRoot()
+
+    if mapRoot then
+        ProcessMapRemovers(mapRoot)
+    end
+end
+
+--========================================================
+-- PART 4: UI CONTROLS
 --========================================================
 
 MainTab:Section({
@@ -895,31 +981,24 @@ MainTab:Section({
 
 MainTab:Toggle({
     Title = "Low Graphics",
-    Desc = "Reduce texturas, sombras y efectos visuales",
+    Desc = "Reduce materiales y sombras",
     Value = Settings.LowGraphics,
-
     Callback = SetLowGraphics
 })
 
 MainTab:Toggle({
     Title = "Extremely Low Graphics",
-    Desc = "Optimización extrema con paleta de colores",
+    Desc = "Optimización visual extrema",
     Value = Settings.ExtremelyLow,
-
     Callback = SetExtremelyLow
 })
 
 MainTab:Toggle({
     Title = "Optimize Lighting",
-    Desc = "Desactiva efectos de iluminación",
+    Desc = "Reduce efectos de iluminación",
     Value = Settings.OptimizeLighting,
-
     Callback = SetOptimizeLighting
 })
-
---========================================================
--- REMOVER CONTROLS
---========================================================
 
 RemoverTab:Section({
     Title = "World Remover"
@@ -927,104 +1006,58 @@ RemoverTab:Section({
 
 RemoverTab:Toggle({
     Title = "Remover vegetación",
-    Desc = "Reemplaza vegetación por copias invisibles con colisión",
+    Desc = "Oculta vegetación y conserva colisiones",
     Value = Settings.RemoveVegetation,
-
     Callback = SetRemoveVegetation
 })
 
 RemoverTab:Toggle({
     Title = "Remover decoración",
-    Desc = "Elimina objetos decorativos del mapa",
+    Desc = "Elimina decoración identificada por nombre",
     Value = Settings.RemoveDecoration,
-
     Callback = SetRemoveDecoration
 })
-
---========================================================
--- SETTINGS
---========================================================
 
 SettingsTab:Section({
     Title = "Interface"
 })
 
-local themes = {}
-
-pcall(function()
-    local availableThemes = WindUI:GetThemes()
-
-    for themeName in pairs(availableThemes) do
-        table.insert(themes, themeName)
-    end
-end)
-
-table.sort(themes)
-
-if #themes > 0 then
-    SettingsTab:Dropdown({
-        Title = "UI Theme",
-        Values = themes,
-        Value = "Dark",
-        SearchBarEnabled = true,
-
-        Callback = function(theme)
-            pcall(function()
-                WindUI:SetTheme(theme)
-            end)
-        end
-    })
-end
-
 SettingsTab:Button({
     Title = "Save Settings",
-    Desc = "Guardar configuración actual",
-
+    Desc = "Guardar configuración",
     Callback = function()
         SaveSettings()
-
-        Notify(
-            "NIGHTSAKEN",
-            "Configuración guardada"
-        )
+        Notify("NIGHTSAKEN", "Configuración guardada")
     end
 })
 
---========================================================
--- INFORMATION
---========================================================
-
 InfoTab:Section({
-    Title = "NIGHTSAKEN v0.2"
+    Title = "NIGHTSAKEN v0.3"
 })
 
 InfoTab:Paragraph({
     Title = "Forsaken Mobile Optimizer",
-    Content = "Optimizador visual diseñado para reducir la carga gráfica en dispositivos móviles."
+    Content = "Optimizador visual para dispositivos móviles."
 })
 
 InfoTab:Paragraph({
-    Title = "Independent Controls",
-    Content = "Low Graphics y Extremely Low Graphics funcionan de forma independiente."
+    Title = "Map Scan",
+    Content = "Una captura por mapa. No repite el escaneo del mismo mapa."
 })
 
 InfoTab:Paragraph({
-    Title = "Vegetation Collision",
-    Content = "Reemplaza piezas compatibles por copias invisibles que conservan sus propiedades físicas."
+    Title = "Vegetation",
+    Content = "Oculta la vegetación visual sin crear copias físicas."
 })
 
 InfoTab:Paragraph({
-    Title = "Decoration Remover",
-    Content = "Conserva el sistema de eliminación de decoración de NIGHTSAKEN v0.1."
+    Title = "Decoration",
+    Content = "Elimina objetos decorativos identificados y protege objetos interactivos."
 })
 
-InfoTab:Paragraph({
-    Title = "Local Changes",
-    Content = "Los cambios se intentan aplicar localmente y no modifican directamente el servidor."
-})
-
+print("[NIGHTSAKEN] Parte 4 cargada")
 --========================================================
--- FIND NEW VEGETATION TARGET
+-- PART 5: NEW OBJECT DETECTION
 --========================================================
 
 local function GetVegetationTarget(object)
@@ -1034,37 +1067,28 @@ local function GetVegetationTarget(object)
 
     local current = object
 
-    -- Buscar primero un modelo de vegetación.
     while current and current ~= Workspace do
         if current:IsA("Model")
             and ContainsKeyword(
                 current.Name,
                 VegetationKeywords
             ) then
-
             return current
         end
 
         current = current.Parent
     end
 
-    -- Si no pertenece a un modelo detectado,
-    -- comprobar la pieza individual.
     if object:IsA("BasePart")
         and ContainsKeyword(
             object.Name,
             VegetationKeywords
         ) then
-
         return object
     end
 
     return nil
 end
-
---========================================================
--- FIND NEW DECORATION TARGET
---========================================================
 
 local function GetDecorationTarget(object)
     if not object or IsCollisionProxy(object) then
@@ -1079,7 +1103,6 @@ local function GetDecorationTarget(object)
                 current.Name,
                 DecorationKeywords
             ) then
-
             return current
         end
 
@@ -1091,140 +1114,137 @@ local function GetDecorationTarget(object)
             object.Name,
             DecorationKeywords
         ) then
-
         return object
     end
 
     return nil
 end
 
---========================================================
--- AUTOMATIC NEW OBJECT DETECTION
---========================================================
+local function ProcessNewObject(object)
+    if not object or not object.Parent then
+        return
+    end
 
-Workspace.DescendantAdded:Connect(function(object)
-    task.delay(0.35, function()
-        if not object.Parent then
-            return
-        end
+    if IsCollisionProxy(object) then
+        return
+    end
 
-        if IsCollisionProxy(object) then
-            return
-        end
+    if Settings.LowGraphics or Settings.ExtremelyLow then
+        OptimizeObject(object)
+    end
 
-        -- Graphics optimization.
-        if Settings.LowGraphics or Settings.ExtremelyLow then
-            OptimizeObject(object)
-        end
+    if not IsMatchActive() then
+        return
+    end
 
-        if Settings.ExtremelyLow
-            and object:IsA("BasePart") then
+    local mapRoot = GetCurrentMapRoot()
 
-            pcall(function()
-                object.Color = Palette[
-                    math.random(1, #Palette)
-                ]
+    if not mapRoot or not object:IsDescendantOf(mapRoot) then
+        return
+    end
+
+    if Settings.RemoveVegetation then
+        local target = GetVegetationTarget(object)
+
+        if target
+            and not VegetationProcessed[target]
+            and not IsProtected(target) then
+
+            VegetationProcessed[target] = true
+
+            EnqueueJob("New Vegetation", function()
+                if IsMatchActive() and target.Parent then
+                    HideVegetation(target)
+                end
             end)
         end
+    end
 
-        -- Automatic vegetation replacement.
-        if Settings.RemoveVegetation then
-            local target = GetVegetationTarget(object)
+    if Settings.RemoveDecoration then
+        local target = GetDecorationTarget(object)
 
-            if target and not ProcessedVegetation[target] then
-                ProcessedVegetation[target] = true
+        if target
+            and not DecorationProcessed[target]
+            and not IsProtected(target) then
 
-                EnqueueJob(
-                    "New Vegetation",
-                    function()
-                        if target.Parent then
-                            RemoveVegetationWithCollision(target)
-                        end
-                    end
-                )
-            end
+            DecorationProcessed[target] = true
+
+            EnqueueJob("New Decoration", function()
+                if IsMatchActive()
+                    and target.Parent
+                    and not IsProtected(target) then
+
+                    pcall(function()
+                        target:Destroy()
+                    end)
+                end
+            end)
         end
+    end
+end
 
-        -- Original decoration removal behavior.
-        if Settings.RemoveDecoration then
-            local target = GetDecorationTarget(object)
-
-            if target and not ProcessedDecoration[target] then
-                ProcessedDecoration[target] = true
-
-                EnqueueJob(
-                    "New Decoration",
-                    function()
-                        if target.Parent
-                            and not IsProtected(target) then
-
-                            pcall(function()
-                                target:Destroy()
-                            end)
-                        end
-                    end
-                )
-            end
-        end
+Workspace.DescendantAdded:Connect(function(object)
+    task.delay(0.5, function()
+        ProcessNewObject(object)
     end)
 end)
 
 --========================================================
--- LOAD SAVED SETTINGS
+-- PART 5: MAP WATCHER
+--========================================================
+
+task.spawn(function()
+    while task.wait(2) do
+        local active = IsMatchActive()
+        local mapRoot = GetCurrentMapRoot()
+
+        if not active or not mapRoot then
+            CurrentMapActive = false
+            CurrentMapReference = nil
+            continue
+        end
+
+        if mapRoot ~= CurrentMapReference then
+            CurrentMapReference = mapRoot
+            CurrentMapActive = true
+
+            print(
+                "[NIGHTSAKEN] Nuevo mapa detectado:",
+                mapRoot.Name
+            )
+
+            ProcessMapRemovers(mapRoot)
+        elseif CurrentMapActive then
+            -- No vuelve a escanear el mapa.
+            -- Solo espera objetos nuevos mediante DescendantAdded.
+        end
+    end
+end)
+
+--========================================================
+-- PART 5: INITIAL LOAD
 --========================================================
 
 task.defer(function()
     if Settings.LowGraphics then
-        EnqueueJob(
-            "Low Graphics",
-            ApplyLowGraphics
-        )
+        SetLowGraphics(true)
     end
 
     if Settings.ExtremelyLow then
-        EnqueueJob(
-            "Extremely Low Graphics",
-            ApplyExtremeGraphics
-        )
+        SetExtremelyLow(true)
     end
 
     if Settings.OptimizeLighting then
-        EnqueueJob(
-            "Optimize Lighting",
-            ApplyLightingOptimization
-        )
+        SetOptimizeLighting(true)
     end
 
-    if Settings.RemoveVegetation then
-        EnqueueJob(
-            "Vegetation Remover",
-            function()
-                local amount, failed = RemoveVegetation()
+    -- Los removers no se ejecutan al cargar.
+    -- Esperan la confirmación de una partida activa.
 
-                Notify(
-                    "Vegetation Remover",
-                    tostring(amount) .. " objetos reemplazados; "
-                    .. tostring(failed) .. " omitidos"
-                )
-            end
-        )
-    end
-
-    if Settings.RemoveDecoration then
-        EnqueueJob(
-            "Decoration Remover",
-            function()
-                local amount = RemoveMatchingObjects(
-                    DecorationKeywords
-                )
-
-                Notify(
-                    "Decoration Remover",
-                    "Decoración eliminada: " .. tostring(amount)
-                )
-            end
-        )
-    end
+    Notify(
+        "NIGHTSAKEN v0.3",
+        "Sistema cargado. Esperando partida."
+    )
 end)
 
 --========================================================
@@ -1232,12 +1252,12 @@ end)
 --========================================================
 
 print("========================================")
-print("NIGHTSAKEN v0.2")
+print("NIGHTSAKEN v0.3")
 print("FORSAKEN MOBILE OPTIMIZER")
-print("LOADED SUCCESSFULLY")
+print("LOADED")
 print("========================================")
 
 Notify(
-    "NIGHTSAKEN v0.2",
+    "NIGHTSAKEN v0.3",
     "Optimizer cargado correctamente"
 )
