@@ -1,7 +1,7 @@
 --==================================================
 -- NIGHTSAKEN v0.0
--- Designed for MediaTek Helio G88
--- UI: WindUI 1.6.66
+-- Helio G88 | WindUI 1.6.66
+-- REBUILT GRAPHICS ENGINE
 --==================================================
 
 local Players = game:GetService("Players")
@@ -11,7 +11,7 @@ local Lighting = game:GetService("Lighting")
 local LocalPlayer = Players.LocalPlayer
 
 --==================================================
--- WINDUI LOADER
+-- WINDUI
 --==================================================
 
 local WindUI = loadstring(game:HttpGet(
@@ -25,15 +25,13 @@ local WindUI = loadstring(game:HttpGet(
 local Settings = {
     LowGraphics = false,
     ExtremelyLowGraphics = false,
-
     RemoveVegetation = false,
     RemoveDecoration = false,
-
     InterfaceColor = Color3.fromHex("#8B5CF6")
 }
 
 --==================================================
--- COLOR PALETTE
+-- COLORS
 --==================================================
 
 local COLORS = {
@@ -43,47 +41,57 @@ local COLORS = {
     DarkBlueGray = Color3.fromHex("#66717D")
 }
 
+local SelectedWallColor
+local SelectedFloorColor
+
 --==================================================
--- ORIGINAL COLOR BACKUP
+-- PERFORMANCE CONTROL
 --==================================================
 
-local OriginalColors = setmetatable({}, {
-    __mode = "k"
-})
+local GameplayStarted = false
+local Processing = false
+local ScanPending = false
 
-local OriginalTextureTransparency = setmetatable({}, {
-    __mode = "k"
-})
+local BATCH_SIZE = 40
 
-local function SaveColor(object)
-    if OriginalColors[object] ~= nil then
-        return
-    end
+-- Weak tables: no guardan copias de propiedades.
+local ProcessedTextures = setmetatable({}, {__mode = "k"})
+local ProcessedMeshes = setmetatable({}, {__mode = "k"})
+local ProcessedSurfaces = setmetatable({}, {__mode = "k"})
+local ProcessedParts = setmetatable({}, {__mode = "k"})
+local HiddenVegetationParts = setmetatable({}, {__mode = "k"})
+local HiddenDecorationParts = setmetatable({}, {__mode = "k"})
 
-    if object:IsA("BasePart") then
-        OriginalColors[object] = object.Color
-    end
-end
+--==================================================
+-- CHARACTER PROTECTION
+--==================================================
 
-local function RestoreColors()
-    for object, color in pairs(OriginalColors) do
-        if object and object.Parent then
-            pcall(function()
-                object.Color = color
-            end)
+local function IsCharacterPart(object)
+    local ancestor = object
+
+    while ancestor and ancestor ~= Workspace do
+        if ancestor:IsA("Model")
+            and ancestor:FindFirstChildOfClass("Humanoid") then
+            return true
         end
 
-        OriginalColors[object] = nil
+        ancestor = ancestor.Parent
     end
+
+    return false
 end
 
 --==================================================
--- LOW GRAPHICS
--- Hide textures without changing object colors
+-- TEXTURE ENGINE
 --==================================================
 
+local function ShouldHideTextures()
+    return Settings.LowGraphics
+        or Settings.ExtremelyLowGraphics
+end
+
 local function ProcessTexture(object)
-    if not Settings.LowGraphics then
+    if not ShouldHideTextures() then
         return
     end
 
@@ -92,31 +100,24 @@ local function ProcessTexture(object)
         return
     end
 
-    if OriginalTextureTransparency[object] == nil then
-        OriginalTextureTransparency[object] =
-            object.Transparency
+    if ProcessedTextures[object] then
+        return
     end
 
-    object.Transparency = 1
-end
+    ProcessedTextures[object] = true
 
-local function RestoreTextures()
-    for object, transparency in pairs(
-        OriginalTextureTransparency
-    ) do
-        if object and object.Parent then
-            pcall(function()
-                object.Transparency = transparency
-            end)
-        end
+    pcall(function()
+        object.Transparency = 1
+    end)
 
-        OriginalTextureTransparency[object] = nil
-    end
+    -- Segundo método: elimina el enlace de imagen.
+    pcall(function()
+        object.Texture = ""
+    end)
 end
 
 --==================================================
--- EXTREMELY LOW GRAPHICS
--- Lighting classification
+-- ADAPTIVE LIGHTING
 --==================================================
 
 local function GetMapLightingType()
@@ -130,30 +131,19 @@ local function GetMapLightingType()
         return "Bright"
     elseif brightness >= 0.30 then
         return "Medium"
-    else
-        return "Dark"
     end
+
+    return "Dark"
 end
 
---==================================================
--- FLOOR DETECTION
---==================================================
-
 local function IsFloor(object)
-    if not object:IsA("BasePart") then
-        return false
-    end
-
-    return object.Size.Y < 4
+    return object:IsA("BasePart")
+        and object.Size.Y < 4
         and (
             object.Size.X > 8
             or object.Size.Z > 8
         )
 end
-
---==================================================
--- ADAPTIVE COLOR SELECTION
---==================================================
 
 local function GetAdaptiveColors()
     local lightingType = GetMapLightingType()
@@ -163,18 +153,71 @@ local function GetAdaptiveColors()
 
     elseif lightingType == "Medium" then
         return COLORS.BlueGray, COLORS.DarkBlueGray
+    end
 
-    else
-        return COLORS.BlueGray, COLORS.LightGray
+    return COLORS.BlueGray, COLORS.LightGray
+end
+
+--==================================================
+-- MESH TEXTURE ENGINE
+--==================================================
+
+local function ProcessMeshTexture(object)
+    if not Settings.ExtremelyLowGraphics then
+        return
+    end
+
+    if ProcessedMeshes[object] then
+        return
+    end
+
+    if object:IsA("MeshPart") then
+        ProcessedMeshes[object] = true
+
+        pcall(function()
+            object.TextureID = ""
+        end)
+
+        pcall(function()
+            object.Material = Enum.Material.SmoothPlastic
+        end)
+
+    elseif object:IsA("SpecialMesh") then
+        ProcessedMeshes[object] = true
+
+        pcall(function()
+            object.TextureId = ""
+        end)
     end
 end
 
 --==================================================
--- EXTREMELY LOW GRAPHICS PROCESSOR
+-- SURFACE APPEARANCE ENGINE
 --==================================================
 
-local SelectedWallColor
-local SelectedFloorColor
+local function ProcessSurfaceAppearance(object)
+    if not Settings.ExtremelyLowGraphics then
+        return
+    end
+
+    if not object:IsA("SurfaceAppearance") then
+        return
+    end
+
+    if ProcessedSurfaces[object] then
+        return
+    end
+
+    ProcessedSurfaces[object] = true
+
+    pcall(function()
+        object:Destroy()
+    end)
+end
+
+--==================================================
+-- SMOOTH MATERIAL ENGINE
+--==================================================
 
 local function ProcessExtremelyLow(object)
     if not Settings.ExtremelyLowGraphics then
@@ -185,105 +228,73 @@ local function ProcessExtremelyLow(object)
         return
     end
 
-    -- No recolorear personajes.
-    local ancestor = object.Parent
+    if IsCharacterPart(object) then
+        return
+    end
 
-    while ancestor and ancestor ~= Workspace do
-        if ancestor:IsA("Model")
-            and ancestor:FindFirstChildOfClass("Humanoid") then
-            return
+    if ProcessedParts[object] then
+        return
+    end
+
+    ProcessedParts[object] = true
+
+    pcall(function()
+        object.Material = Enum.Material.SmoothPlastic
+        object.MaterialVariant = ""
+        object.Reflectance = 0
+
+        if IsFloor(object) then
+            object.Color = SelectedFloorColor
+        else
+            object.Color = SelectedWallColor
         end
-
-        ancestor = ancestor.Parent
-    end
-
-    SaveColor(object)
-
-    if IsFloor(object) then
-        object.Color = SelectedFloorColor
-    else
-        object.Color = SelectedWallColor
-    end
+    end)
 end--==================================================
 -- REMOVER 🛡️
--- Name-based object categories
--- No original transparency backup
 --==================================================
 
 local VegetationNames = {
-    "tree",
-    "rock",
-    "stone",
-    "log",
-    "grass",
-    "flower",
-    "bush",
-    "foliage",
-    "vegetation",
-    "pasto",
-    "cesped",
-    "césped",
-    "arbol",
-    "árbol",
-    "piedra",
-    "tronco",
-    "arbusto",
-    "flores",
-    "tierra"
+    "tree", "rock", "stone", "log", "grass",
+    "flower", "bush", "foliage", "vegetation",
+    "pasto", "cesped", "césped", "arbol", "árbol",
+    "piedra", "tronco", "arbusto", "flores", "tierra"
 }
 
 local DecorationNames = {
-    "chair",
-    "furniture",
-    "cushion",
-    "pillow",
-    "curtain",
-    "table",
-    "round",
-    "ball",
-    "mini chair",
-    "box",
-    "chest",
-    "painting",
-    "picture",
-    "photo",
-    "food",
-    "food stand",
-    "helmet",
-    "straw",
-    "closet",
-    "lamp",
-    "flowerpot",
-    "pot",
-    "drawer",
-    "silla",
-    "mueble",
-    "cojin",
-    "cojín",
-    "cortina",
-    "mesa",
-    "pelota",
-    "caja",
-    "cofre",
-    "cuadro",
-    "foto",
-    "comida",
-    "casco",
-    "paja",
-    "closet",
-    "clóset",
-    "lampara",
-    "lámpara",
-    "maceta",
-    "cajon",
-    "cajón"
+    "chair", "furniture", "cushion", "pillow",
+    "curtain", "table", "round", "mini chair",
+    "box", "chest", "painting", "picture", "photo",
+    "food", "food stand", "helmet", "straw", "closet",
+    "lamp", "flowerpot", "pot", "drawer",
+    "silla", "mueble", "cojin", "cojín", "cortina",
+    "mesa", "pelota", "caja", "cofre", "cuadro",
+    "foto", "comida", "casco", "paja", "clóset",
+    "lampara", "lámpara", "maceta", "cajon", "cajón"
 }
 
+local function NormalizeName(name)
+    name = string.lower(name)
+
+    name = name:gsub("á", "a")
+    name = name:gsub("é", "e")
+    name = name:gsub("í", "i")
+    name = name:gsub("ó", "o")
+    name = name:gsub("ú", "u")
+    name = name:gsub("ñ", "n")
+
+    return name
+end
+
 local function NameMatches(object, names)
-    local objectName = string.lower(object.Name)
+    local objectName = NormalizeName(object.Name)
 
     for _, keyword in ipairs(names) do
-        if string.find(objectName, keyword, 1, true) then
+        if string.find(
+            objectName,
+            NormalizeName(keyword),
+            1,
+            true
+        ) then
             return true
         end
     end
@@ -291,15 +302,40 @@ local function NameMatches(object, names)
     return false
 end
 
-local function HidePartsInside(object)
-    if object:IsA("BasePart") then
+--==================================================
+-- HIDE MATCHING PARTS
+--==================================================
+
+local function HidePart(object, cache)
+    if not object:IsA("BasePart") then
+        return
+    end
+
+    if IsCharacterPart(object) then
+        return
+    end
+
+    if cache[object] then
+        return
+    end
+
+    cache[object] = true
+
+    pcall(function()
         object.Transparency = 1
+    end)
+end
+
+local function HidePartsInside(object, cache)
+    HidePart(object, cache)
+
+    if not object:IsA("Model")
+        and not object:IsA("Folder") then
+        return
     end
 
     for _, descendant in ipairs(object:GetDescendants()) do
-        if descendant:IsA("BasePart") then
-            descendant.Transparency = 1
-        end
+        HidePart(descendant, cache)
     end
 end
 
@@ -307,21 +343,180 @@ local function ProcessRemoverObject(object)
     if Settings.RemoveVegetation
         and NameMatches(object, VegetationNames) then
 
-        HidePartsInside(object)
+        HidePartsInside(object, HiddenVegetationParts)
     end
 
     if Settings.RemoveDecoration
         and NameMatches(object, DecorationNames) then
 
-        HidePartsInside(object)
+        HidePartsInside(object, HiddenDecorationParts)
     end
 end
 
 --==================================================
--- GAMEPLAY START GATE
+-- OBJECT PROCESSOR
 --==================================================
 
-local GameplayStarted = false
+local function ProcessObject(object)
+    if not object or not object.Parent then
+        return
+    end
+
+    if ShouldHideTextures() then
+        ProcessTexture(object)
+    end
+
+    if Settings.ExtremelyLowGraphics then
+        ProcessMeshTexture(object)
+        ProcessSurfaceAppearance(object)
+        ProcessExtremelyLow(object)
+    end
+
+    if Settings.RemoveVegetation
+        or Settings.RemoveDecoration then
+        ProcessRemoverObject(object)
+    end
+end
+
+--==================================================
+-- CONTROLLED SCANNER
+--==================================================
+
+local function ScanWorkspace()
+    if not GameplayStarted then
+        return
+    end
+
+    if not (
+        ShouldHideTextures()
+        or Settings.RemoveVegetation
+        or Settings.RemoveDecoration
+    ) then
+        return
+    end
+
+    if Processing then
+        ScanPending = true
+        return
+    end
+
+    Processing = true
+
+    task.spawn(function()
+        repeat
+            ScanPending = false
+
+            if Settings.ExtremelyLowGraphics then
+                SelectedWallColor, SelectedFloorColor =
+                    GetAdaptiveColors()
+            end
+
+            local descendants = Workspace:GetDescendants()
+
+            for index, object in ipairs(descendants) do
+                ProcessObject(object)
+
+                if index % BATCH_SIZE == 0 then
+                    task.wait()
+                end
+            end
+
+        until not ScanPending
+
+        Processing = false
+    end)
+end
+
+--==================================================
+-- TOGGLE FUNCTIONS
+--==================================================
+
+local function SetLowGraphics(value)
+    Settings.LowGraphics = value
+
+    if value and GameplayStarted then
+        ScanWorkspace()
+    end
+end
+
+local function SetExtremelyLowGraphics(value)
+    Settings.ExtremelyLowGraphics = value
+
+    if value and GameplayStarted then
+        SelectedWallColor, SelectedFloorColor =
+            GetAdaptiveColors()
+
+        ScanWorkspace()
+    end
+end
+
+local function SetRemoveVegetation(value)
+    Settings.RemoveVegetation = value
+
+    if value and GameplayStarted then
+        ScanWorkspace()
+    end
+end
+
+local function SetRemoveDecoration(value)
+    Settings.RemoveDecoration = value
+
+    if value and GameplayStarted then
+        ScanWorkspace()
+    end
+end
+
+--==================================================
+-- NEW OBJECT QUEUE
+--==================================================
+
+local NewObjectQueue = {}
+local QueueRunning = false
+
+local function AddNewObject(object)
+    if not GameplayStarted then
+        return
+    end
+
+    if not (
+        ShouldHideTextures()
+        or Settings.RemoveVegetation
+        or Settings.RemoveDecoration
+    ) then
+        return
+    end
+
+    NewObjectQueue[#NewObjectQueue + 1] = object
+
+    if QueueRunning then
+        return
+    end
+
+    QueueRunning = true
+
+    task.spawn(function()
+        while #NewObjectQueue > 0 do
+            local objectToProcess = table.remove(
+                NewObjectQueue,
+                1
+            )
+
+            if objectToProcess and objectToProcess.Parent then
+                ProcessObject(objectToProcess)
+            end
+
+            task.wait()
+        end
+
+        QueueRunning = false
+    end)
+end
+
+Workspace.DescendantAdded:Connect(AddNewObject)
+
+--==================================================
+-- GAMEPLAY START GATE
+--==================================================
 
 local function IsGameplayActive()
     local character = LocalPlayer.Character
@@ -342,17 +537,11 @@ local function IsGameplayActive()
         return false
     end
 
-    -- Espera a que el jugador pueda moverse.
-    -- Esto evita iniciar durante intros donde el personaje está bloqueado.
     if humanoid.WalkSpeed <= 0 then
         return false
     end
 
-    if humanoid.MoveDirection.Magnitude < 0.05 then
-        return false
-    end
-
-    return true
+    return humanoid.MoveDirection.Magnitude >= 0.05
 end
 
 local function WaitForGameplay()
@@ -375,133 +564,17 @@ local function WaitForGameplay()
 end
 
 --==================================================
--- MAIN PROCESSOR
+-- CHARACTER RESPAWN PROTECTION
 --==================================================
 
-local Processing = false
+LocalPlayer.CharacterAdded:Connect(function()
+    -- No se inicia otro escaneo durante la carga
+    -- del personaje o una posible cinemática.
+    task.wait(2)
 
-local function ProcessObject(object)
-    if not object or not object.Parent then
-        return
-    end
-
-    ProcessTexture(object)
-
-    ProcessRemoverObject(object)
-
-    ProcessExtremelyLow(object)
-end
-
-local function ScanWorkspace()
-    if not GameplayStarted or Processing then
-        return
-    end
-
-    Processing = true
-
-    task.spawn(function()
-        if Settings.ExtremelyLowGraphics then
-            SelectedWallColor, SelectedFloorColor =
-                GetAdaptiveColors()
-        end
-
-        local descendants = Workspace:GetDescendants()
-
-        for index, object in ipairs(descendants) do
-            ProcessObject(object)
-
-            if index % 150 == 0 then
-                task.wait()
-            end
-        end
-
-        Processing = false
-    end)
-end
-
---==================================================
--- TOGGLE FUNCTIONS
---==================================================
-
-local function SetLowGraphics(value)
-    Settings.LowGraphics = value
-
-    if not GameplayStarted then
-        return
-    end
-
-    if value then
-        ScanWorkspace()
-    else
-        RestoreTextures()
-    end
-end
-
-local function SetExtremelyLowGraphics(value)
-    Settings.ExtremelyLowGraphics = value
-
-    if not GameplayStarted then
-        return
-    end
-
-    if value then
-        SelectedWallColor, SelectedFloorColor =
-            GetAdaptiveColors()
-
-        ScanWorkspace()
-    else
-        RestoreColors()
-    end
-end
-
-local function SetRemoveVegetation(value)
-    Settings.RemoveVegetation = value
-
-    if value and GameplayStarted then
+    if GameplayStarted then
         ScanWorkspace()
     end
-end
-
-local function SetRemoveDecoration(value)
-    Settings.RemoveDecoration = value
-
-    if value and GameplayStarted then
-        ScanWorkspace()
-    end
-end
-
---==================================================
--- NEW OBJECTS
---==================================================
-
-Workspace.DescendantAdded:Connect(function(object)
-    if not GameplayStarted then
-        return
-    end
-
-    if not (
-        Settings.LowGraphics
-        or Settings.ExtremelyLowGraphics
-        or Settings.RemoveVegetation
-        or Settings.RemoveDecoration
-    ) then
-        return
-    end
-
-    task.defer(function()
-        if object and object.Parent then
-            ProcessObject(object)
-        end
-    end)
-end)
-
---==================================================
--- CLEANUP REMOVED OBJECTS
---==================================================
-
-Workspace.DescendantRemoving:Connect(function(object)
-    OriginalColors[object] = nil
-    OriginalTextureTransparency[object] = nil
 end)--==================================================
 -- CUSTOM INTERFACE THEME
 --==================================================
@@ -511,7 +584,6 @@ local function ApplyInterfaceColor(color)
 
     WindUI:AddTheme({
         Name = "NIGHTSAKEN_CUSTOM",
-
         Accent = color,
         Background = Color3.fromHex("#101014"),
         Outline = Color3.fromHex("#35353D"),
@@ -532,7 +604,6 @@ local Window = WindUI:CreateWindow({
     Title = "NIGHTSAKEN",
     Icon = "moon",
     Author = "Helio G88 Optimizer",
-
     Folder = "NIGHTSAKEN_V00",
 
     Size = UDim2.fromOffset(520, 580),
@@ -574,12 +645,22 @@ local SettingsTab = Window:Tab({
 
 UpdatesTab:Paragraph({
     Title = "NIGHTSAKEN v0.0",
-    Desc = "A new beginning. Designed for MediaTek Helio G88."
+    Desc = "Rebuilt graphics engine for MediaTek Helio G88."
 })
 
 UpdatesTab:Paragraph({
-    Title = "Optimization Start",
-    Desc = "Optimizations wait until gameplay begins. They do not run during the killer intro."
+    Title = "Texture Engine",
+    Desc = "Double removal method for Decal and Texture images."
+})
+
+UpdatesTab:Paragraph({
+    Title = "Extremely Low Graphics",
+    Desc = "SmoothPlastic, mesh texture removal and SurfaceAppearance destruction."
+})
+
+UpdatesTab:Paragraph({
+    Title = "Performance",
+    Desc = "Controlled batches and protection against repeated processing."
 })
 
 --==================================================
@@ -588,7 +669,7 @@ UpdatesTab:Paragraph({
 
 OptimizerTab:Toggle({
     Title = "Low Graphics",
-    Desc = "Hides all Decal and Texture images while preserving object colors.",
+    Desc = "Hides Decal and Texture images using two methods.",
     Value = false,
 
     Callback = function(value)
@@ -598,7 +679,7 @@ OptimizerTab:Toggle({
 
 OptimizerTab:Toggle({
     Title = "Extremely Low Graphics",
-    Desc = "Uses adaptive four-color graphics based on OutdoorAmbient.",
+    Desc = "Removes surface images, mesh textures and complex materials.",
     Value = false,
 
     Callback = function(value)
@@ -612,7 +693,7 @@ OptimizerTab:Toggle({
 
 RemoverTab:Toggle({
     Title = "Remove Vegetation",
-    Desc = "Hides trees, rocks, logs, grass, flowers, bushes and dirt.",
+    Desc = "Hides vegetation, trees, rocks, logs, grass, flowers and dirt.",
     Value = false,
 
     Callback = function(value)
@@ -657,8 +738,6 @@ SettingsTab:Colorpicker({
 task.spawn(function()
     WaitForGameplay()
 
-    -- La primera optimización ocurre después
-    -- de que el jugador ya puede moverse.
     task.wait(0.5)
 
     ScanWorkspace()
@@ -670,4 +749,4 @@ end)
 -- END
 --==================================================
 
-print("NIGHTSAKEN v0.0 loaded.")
+print("NIGHTSAKEN v0.0 loaded successfully.")
